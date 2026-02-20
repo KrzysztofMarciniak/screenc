@@ -9,3 +9,4 @@ chmod +x ./make.sh;
 screenc
 ./make.sh clean # delete compiled binary 
 ```
+![screenshot2](screenshot2.png)
