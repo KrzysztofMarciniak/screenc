@@ -15,8 +15,10 @@ typedef enum {
         ERR_SAVE_PNG,
 } Error;
 
+typedef char Filename;
+
 typedef struct {
-        char* filename;
+        Filename* filename;
         Error error;
 } FilenameWithError;
 
@@ -27,6 +29,11 @@ typedef struct {
         char* filename;
 } CleanupVariables;
 
+typedef struct {
+    int width;
+    int height;
+} WidthHeight;
+
 void cleanup(CleanupVariables* cv) {
         if (!cv) return;
         if (cv->data) free(cv->data);
@@ -35,30 +42,41 @@ void cleanup(CleanupVariables* cv) {
         if (cv->disp) XCloseDisplay(cv->disp);
 }
 
-Error grab_screenshot(Display** disp_out, XImage** img_out, int* w, int* h) {
-        Display* disp = XOpenDisplay(NULL);
-        if (!disp) {
-                fprintf(stderr, "Error: Cannot open X display\n");
-                return ERR_DISPLAY;
-        }
+typedef struct{
+    WidthHeight wh;
+    Display* dp;
+    XImage* img;
+    Error error;
+} ScreenshotVariables;
 
-        Window root = RootWindow(disp, DefaultScreen(disp));
-        XWindowAttributes gwa;
-        XGetWindowAttributes(disp, root, &gwa);
+ScreenshotVariables grab_screenshot(void) {
+    ScreenshotVariables sv = {0};
 
-        XImage* img = XGetImage(disp, root, 0, 0, gwa.width, gwa.height,
-                                AllPlanes, ZPixmap);
-        if (!img) {
-                fprintf(stderr, "Error: XGetImage failed\n");
-                XCloseDisplay(disp);
-                return ERR_IMAGE;
-        }
+    sv.disp = XOpenDisplay(NULL);
+    if (!sv.disp) {
+        fprintf(stderr, "Error: Cannot open X display\n");
+        sv.error = ERR_DISPLAY;
+        return sv;
+    }
 
-        *disp_out = disp;
-        *img_out  = img;
-        *w        = gwa.width;
-        *h        = gwa.height;
-        return ERR_OK;
+    Window root = RootWindow(sv.disp, DefaultScreen(sv.disp));
+    XWindowAttributes gwa;
+    XGetWindowAttributes(sv.disp, root, &gwa);
+
+    sv.img = XGetImage(sv.disp, root, 0, 0, gwa.width, gwa.height,
+                       AllPlanes, ZPixmap);
+    if (!sv.img) {
+        fprintf(stderr, "Error: XGetImage failed\n");
+        XCloseDisplay(sv.disp);
+        sv.disp = NULL;
+        sv.error = ERR_IMAGE;
+        return sv;
+    }
+
+    sv.wh.width  = gwa.width;
+    sv.wh.height = gwa.height;
+    sv.error = ERR_OK;
+    return sv;
 }
 
 Error extract_data(XImage* img, unsigned char** data_out) {
@@ -134,8 +152,7 @@ FilenameWithError make_filename(void) {
         return result;
 }
 
-Error save_png(const char* filename, unsigned char* data, int width,
-               int height) {
+Error save_png(const Filename* filename, unsigned char* data, WidthHeight wh) {
         FILE* fp = fopen(filename, "wb");
         if (!fp) {
                 perror("fopen");
@@ -159,11 +176,11 @@ Error save_png(const char* filename, unsigned char* data, int width,
         }
 
         png_init_io(png_ptr, fp);
-        png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGB,
+        png_set_IHDR(png_ptr, info_ptr, wh.width, wh.height, 8, PNG_COLOR_TYPE_RGB,
                      PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_BASE,
                      PNG_FILTER_TYPE_BASE);
 
-        png_bytep* row_pointers = malloc(sizeof(png_bytep) * height);
+        png_bytep* row_pointers = malloc(sizeof(png_bytep) * wh.height);
         if (!row_pointers) {
                 fprintf(stderr, "Memory error\n");
                 png_destroy_write_struct(&png_ptr, &info_ptr);
@@ -171,7 +188,7 @@ Error save_png(const char* filename, unsigned char* data, int width,
                 return ERR_MEMORY_PNG;
         }
 
-        for (int y = 0; y < height; y++) row_pointers[y] = data + y * width * 3;
+        for (int y = 0; y < wh.height; y++) row_pointers[y] = data + y * wh.width * 3;
 
         png_set_rows(png_ptr, info_ptr, row_pointers);
         png_write_png(png_ptr, info_ptr, PNG_TRANSFORM_IDENTITY, NULL);
@@ -183,36 +200,39 @@ Error save_png(const char* filename, unsigned char* data, int width,
 }
 
 int main(void) {
-        CleanupVariables cv = {0};
-        int width, height;
+    CleanupVariables cv = {0};
+    ScreenshotVariables sv = grab_screenshot();
 
-        Error e = grab_screenshot(&cv.disp, &cv.img, &width, &height);
-        if (e != ERR_OK) {
-                cleanup(&cv);
-                return e;
-        }
+    if (sv.error != ERR_OK) {
+        cleanup(&cv);
+        return sv.error;
+    }
 
-        e = extract_data(cv.img, &cv.data);
-        if (e != ERR_OK) {
-                cleanup(&cv);
-                return e;
-        }
+    cv.disp = sv.disp;
+    cv.img  = sv.img;
+    WidthHeight wh = sv.wh;
 
-        FilenameWithError fwe = make_filename();
-        if (fwe.error != ERR_OK) {
-                fprintf(stderr, "Error: failed to allocate filename\n");
-                cleanup(&cv);
-                return fwe.error;
-        }
-        cv.filename = fwe.filename;
-
-        e = save_png(cv.filename, cv.data, width, height);
-        if (e != ERR_OK) {
-                fprintf(stderr, "Error saving PNG: %s\n", cv.filename);
-        } else {
-                printf("Saved screenshot as '%s'\n", cv.filename);
-        }
-
+    Error e = extract_data(cv.img, &cv.data);
+    if (e != ERR_OK) {
         cleanup(&cv);
         return e;
+    }
+
+    FilenameWithError fwe = make_filename();
+    if (fwe.error != ERR_OK) {
+        fprintf(stderr, "Error: failed to allocate filename\n");
+        cleanup(&cv);
+        return fwe.error;
+    }
+    cv.filename = fwe.filename;
+
+    e = save_png(cv.filename, cv.data, wh);
+    if (e != ERR_OK) {
+        fprintf(stderr, "Error saving PNG: %s\n", cv.filename);
+    } else {
+        printf("Saved screenshot as '%s'\n", cv.filename);
+    }
+
+    cleanup(&cv);
+    return e;
 }
