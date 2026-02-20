@@ -15,8 +15,10 @@ typedef enum {
         ERR_SAVE_PNG,
 } Error;
 
+typedef char Filename;
+
 typedef struct {
-        char* filename;
+        Filename* filename;
         Error error;
 } FilenameWithError;
 
@@ -27,6 +29,11 @@ typedef struct {
         char* filename;
 } CleanupVariables;
 
+typedef struct {
+    int width;
+    int height;
+} WidthHeight;
+
 void cleanup(CleanupVariables* cv) {
         if (!cv) return;
         if (cv->data) free(cv->data);
@@ -35,7 +42,7 @@ void cleanup(CleanupVariables* cv) {
         if (cv->disp) XCloseDisplay(cv->disp);
 }
 
-Error grab_screenshot(Display** disp_out, XImage** img_out, int* w, int* h) {
+Error grab_screenshot(Display** disp_out, XImage** img_out, WidthHeight wh) {
         Display* disp = XOpenDisplay(NULL);
         if (!disp) {
                 fprintf(stderr, "Error: Cannot open X display\n");
@@ -56,8 +63,8 @@ Error grab_screenshot(Display** disp_out, XImage** img_out, int* w, int* h) {
 
         *disp_out = disp;
         *img_out  = img;
-        *w        = gwa.width;
-        *h        = gwa.height;
+        wh.width        = gwa.width;
+        wh.height        = gwa.height;
         return ERR_OK;
 }
 
@@ -134,8 +141,7 @@ FilenameWithError make_filename(void) {
         return result;
 }
 
-Error save_png(const char* filename, unsigned char* data, int width,
-               int height) {
+Error save_png(const Filename* filename, unsigned char* data, WidthHeight wh) {
         FILE* fp = fopen(filename, "wb");
         if (!fp) {
                 perror("fopen");
@@ -159,11 +165,11 @@ Error save_png(const char* filename, unsigned char* data, int width,
         }
 
         png_init_io(png_ptr, fp);
-        png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGB,
+        png_set_IHDR(png_ptr, info_ptr, wh.width, wh.height, 8, PNG_COLOR_TYPE_RGB,
                      PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_BASE,
                      PNG_FILTER_TYPE_BASE);
 
-        png_bytep* row_pointers = malloc(sizeof(png_bytep) * height);
+        png_bytep* row_pointers = malloc(sizeof(png_bytep) * wh.height);
         if (!row_pointers) {
                 fprintf(stderr, "Memory error\n");
                 png_destroy_write_struct(&png_ptr, &info_ptr);
@@ -171,7 +177,7 @@ Error save_png(const char* filename, unsigned char* data, int width,
                 return ERR_MEMORY_PNG;
         }
 
-        for (int y = 0; y < height; y++) row_pointers[y] = data + y * width * 3;
+        for (int y = 0; y < wh.height; y++) row_pointers[y] = data + y * wh.width * 3;
 
         png_set_rows(png_ptr, info_ptr, row_pointers);
         png_write_png(png_ptr, info_ptr, PNG_TRANSFORM_IDENTITY, NULL);
@@ -184,9 +190,9 @@ Error save_png(const char* filename, unsigned char* data, int width,
 
 int main(void) {
         CleanupVariables cv = {0};
-        int width, height;
+        WidthHeight wh = {0, 0};
 
-        Error e = grab_screenshot(&cv.disp, &cv.img, &width, &height);
+        Error e = grab_screenshot(&cv.disp, &cv.img, wh);
         if (e != ERR_OK) {
                 cleanup(&cv);
                 return e;
@@ -206,7 +212,7 @@ int main(void) {
         }
         cv.filename = fwe.filename;
 
-        e = save_png(cv.filename, cv.data, width, height);
+        e = save_png(cv.filename, cv.data, wh);
         if (e != ERR_OK) {
                 fprintf(stderr, "Error saving PNG: %s\n", cv.filename);
         } else {
