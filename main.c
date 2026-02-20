@@ -44,7 +44,7 @@ void cleanup(CleanupVariables* cv) {
 
 typedef struct {
         WidthHeight wh;
-        Display* dp;
+        Display* disp;
         XImage* img;
         Error error;
 } ScreenshotVariables;
