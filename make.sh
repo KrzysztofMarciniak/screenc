@@ -5,7 +5,7 @@ CC=cc
 SRC="main.c"
 TARGET="screenc"
 
-CFLAGS="-Wall -O2"
+CFLAGS="-std=c99 -Wall -O2"
 LDFLAGS="-lpng -lX11"
 
 if [ "$OS" = "OpenBSD" ]; then
