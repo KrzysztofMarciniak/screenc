@@ -1,6 +1,5 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
-#include <X11/cursorfont.h>
 #include <png.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,38 +103,29 @@ CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
 	int end_x = 0, end_y = 0;
 	int selection_active = 0;
 
-	/* Create transparent overlay window for input handling */
+	/* Create overlay window - transparent but input-aware */
 	XSetWindowAttributes attr;
 	attr.background_pixel = BlackPixel(disp, DefaultScreen(disp));
 	attr.override_redirect = True;
-	attr.save_under = True;
 	Window overlay = XCreateWindow(disp, root, 0, 0, screen_width, screen_height,
 	                                 0, CopyFromParent, InputOutput, CopyFromParent,
-	                                 CWBackPixel | CWOverrideRedirect | CWSaveUnder, &attr);
+	                                 CWBackPixel | CWOverrideRedirect, &attr);
 
 	XMapWindow(disp, overlay);
 	XRaiseWindow(disp, overlay);
-	XSelectInput(disp, overlay, PointerMotionMask | ButtonPressMask | ButtonReleaseMask);
+	XSelectInput(disp, overlay, PointerMotionMask | ButtonPressMask | ButtonReleaseMask | ExposureMask);
 
-	/* Make window transparent */
-	XSetWindowAttributes trans_attr;
-	trans_attr.background_pixmap = None;
-	XChangeWindowAttributes(disp, overlay, CWBackPixmap, &trans_attr);
-
-	/* Create GC for drawing red rectangle */
-	GC gc = XCreateGC(disp, root, 0, NULL);
+	/* Create GC for drawing red rectangle on overlay */
+	GC gc = XCreateGC(disp, overlay, 0, NULL);
 
 	/* Set red color */
 	XColor red_color, dummy;
 	XAllocNamedColor(disp, DefaultColormap(disp, DefaultScreen(disp)),
 	                  "red", &red_color, &dummy);
 	XSetForeground(disp, gc, red_color.pixel);
-	XSetLineAttributes(disp, gc, 2, LineSolid, CapButt, JoinBevel);
-	XSetFunction(disp, gc, GXxor);
+	XSetLineAttributes(disp, gc, 3, LineSolid, CapButt, JoinBevel);
 
 	fprintf(stderr, "Click and drag to select crop area...\n");
-
-	int last_x = 0, last_y = 0, last_w = 0, last_h = 0;
 
 	while (1) {
 		XNextEvent(disp, &event);
@@ -145,52 +135,32 @@ CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
 				start_x = event.xbutton.x;
 				start_y = event.xbutton.y;
 				selection_active = 1;
-				last_x = start_x;
-				last_y = start_y;
-				last_w = 0;
-				last_h = 0;
 			}
 		} else if (event.type == MotionNotify && selection_active) {
 			end_x = event.xmotion.x;
 			end_y = event.xmotion.y;
+
+			/* Clear and redraw */
+			XClearWindow(disp, overlay);
 
 			int x = (start_x < end_x) ? start_x : end_x;
 			int y = (start_y < end_y) ? start_y : end_y;
 			int w = (start_x < end_x) ? (end_x - start_x) : (start_x - end_x);
 			int h = (start_y < end_y) ? (end_y - start_y) : (start_y - end_y);
 
-			/* Erase last rectangle */
-			if (last_w > 0 && last_h > 0) {
-				XDrawRectangle(disp, root, gc, last_x, last_y, last_w, last_h);
-			}
-
-			/* Draw new rectangle */
 			if (w > 0 && h > 0) {
-				XDrawRectangle(disp, root, gc, x, y, w, h);
+				XDrawRectangle(disp, overlay, gc, x, y, w, h);
 			}
-
-			last_x = x;
-			last_y = y;
-			last_w = w;
-			last_h = h;
-
 			XSync(disp, False);
-			XFlush(disp);
 		} else if (event.type == ButtonRelease) {
 			end_x = event.xbutton.x;
 			end_y = event.xbutton.y;
-
-			/* Clear the last rectangle */
-			if (last_w > 0 && last_h > 0) {
-				XDrawRectangle(disp, root, gc, last_x, last_y, last_w, last_h);
-			}
 			break;
 		}
 	}
 
 	XDestroyWindow(disp, overlay);
 	XFreeGC(disp, gc);
-	XSync(disp, False);
 
 	rect.x = (start_x < end_x) ? start_x : end_x;
 	rect.y = (start_y < end_y) ? start_y : end_y;
