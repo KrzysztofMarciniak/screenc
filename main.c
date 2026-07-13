@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <omp.h>
 
 typedef enum {
 	ERR_OK = 0,
@@ -35,6 +36,7 @@ Error extract_data(XImage* img, unsigned char** data_out, CropRect* crop) {
 	int height = crop ? crop->height : img->height;
 	int start_x = crop ? crop->x : 0;
 	int start_y = crop ? crop->y : 0;
+	int bytes_per_pixel = img->bits_per_pixel / 8;
 
 	unsigned char* data = malloc(width * height * 3);
 	if (!data) {
@@ -61,13 +63,39 @@ Error extract_data(XImage* img, unsigned char** data_out, CropRect* crop) {
 		b_shift++;
 	}
 
-	for (int y = 0; y < height; y++) {
-		for (int x = 0; x < width; x++) {
-			unsigned long pixel = XGetPixel(img, start_x + x, start_y + y);
-			unsigned char* p    = &data[(y * width + x) * 3];
-			p[0] = (pixel & img->red_mask) >> r_shift;
-			p[1] = (pixel & img->green_mask) >> g_shift;
-			p[2] = (pixel & img->blue_mask) >> b_shift;
+	/* Fast path: direct buffer access if 24-bit or 32-bit */
+	if ((bytes_per_pixel == 3 || bytes_per_pixel == 4) && img->format == ZPixmap) {
+		unsigned char* src_base = (unsigned char*)img->data + start_y * img->bytes_per_line;
+		
+		#pragma omp parallel for collapse(2)
+		for (int y = 0; y < height; y++) {
+			for (int x = 0; x < width; x++) {
+				unsigned char* src_pixel = src_base + y * img->bytes_per_line + (start_x + x) * bytes_per_pixel;
+				unsigned long pixel;
+				
+				if (bytes_per_pixel == 4) {
+					pixel = *(unsigned int*)src_pixel;
+				} else {
+					pixel = src_pixel[0] | (src_pixel[1] << 8) | (src_pixel[2] << 16);
+				}
+				
+				unsigned char* dst = &data[(y * width + x) * 3];
+				dst[0] = (pixel & img->red_mask) >> r_shift;
+				dst[1] = (pixel & img->green_mask) >> g_shift;
+				dst[2] = (pixel & img->blue_mask) >> b_shift;
+			}
+		}
+	} else {
+		/* Fallback: use XGetPixel */
+		#pragma omp parallel for collapse(2)
+		for (int y = 0; y < height; y++) {
+			for (int x = 0; x < width; x++) {
+				unsigned long pixel = XGetPixel(img, start_x + x, start_y + y);
+				unsigned char* p    = &data[(y * width + x) * 3];
+				p[0] = (pixel & img->red_mask) >> r_shift;
+				p[1] = (pixel & img->green_mask) >> g_shift;
+				p[2] = (pixel & img->blue_mask) >> b_shift;
+			}
 		}
 	}
 
@@ -82,6 +110,7 @@ CropRect select_crop_area(Display* disp, XImage* img, int screen_width, int scre
 	int start_x = 0, start_y = 0;
 	int end_x = 0, end_y = 0;
 	int selection_active = 0;
+	Pixmap cached_pixmap = None;
 
 	/* Create overlay window */
 	XSetWindowAttributes attr;
@@ -97,8 +126,12 @@ CropRect select_crop_area(Display* disp, XImage* img, int screen_width, int scre
 
 	GC gc = XCreateGC(disp, overlay, 0, NULL);
 
-	/* Display the full screenshot */
-	XPutImage(disp, overlay, gc, img, 0, 0, 0, 0, screen_width, screen_height);
+	/* Cache the screenshot as a pixmap for fast redraws */
+	cached_pixmap = XCreatePixmap(disp, overlay, screen_width, screen_height, DefaultDepth(disp, DefaultScreen(disp)));
+	XPutImage(disp, cached_pixmap, gc, img, 0, 0, 0, 0, screen_width, screen_height);
+
+	/* Draw cached pixmap to overlay */
+	XCopyArea(disp, cached_pixmap, overlay, gc, 0, 0, screen_width, screen_height, 0, 0);
 
 	/* Create GC for red rectangle */
 	GC rect_gc = XCreateGC(disp, overlay, 0, NULL);
@@ -123,8 +156,8 @@ CropRect select_crop_area(Display* disp, XImage* img, int screen_width, int scre
 			end_x = event.xmotion.x;
 			end_y = event.xmotion.y;
 
-			/* Redraw screenshot */
-			XPutImage(disp, overlay, gc, img, 0, 0, 0, 0, screen_width, screen_height);
+			/* Redraw cached pixmap only, not the full image */
+			XCopyArea(disp, cached_pixmap, overlay, gc, 0, 0, screen_width, screen_height, 0, 0);
 
 			int x = (start_x < end_x) ? start_x : end_x;
 			int y = (start_y < end_y) ? start_y : end_y;
@@ -142,6 +175,7 @@ CropRect select_crop_area(Display* disp, XImage* img, int screen_width, int scre
 		}
 	}
 
+	XFreePixmap(disp, cached_pixmap);
 	XDestroyWindow(disp, overlay);
 	XFreeGC(disp, rect_gc);
 	XFreeGC(disp, gc);
@@ -258,6 +292,8 @@ Error save_png(const char* filepath, unsigned char* data, WidthHeight wh) {
 	}
 
 	png_init_io(png_ptr, fp);
+	/* Use faster compression level (6 instead of default 9) */
+	png_set_compression_level(png_ptr, 6);
 	png_set_IHDR(png_ptr, info_ptr, wh.width, wh.height, 8,
 	             PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
 	             PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
