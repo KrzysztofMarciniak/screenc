@@ -1,6 +1,5 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
-#include <X11/Ximage.h>
 #include <png.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +38,6 @@ typedef struct {
 
 typedef struct {
 	Display* disp;
-	XImage* img;
 	unsigned char* data;
 	char* filename;
 } CleanupVariables;
@@ -48,14 +46,13 @@ void cleanup(CleanupVariables* cv) {
 	if (!cv) return;
 	if (cv->data) free(cv->data);
 	if (cv->filename) free(cv->filename);
-	if (cv->img) XDestroyImage(cv->img);
 	if (cv->disp) XCloseDisplay(cv->disp);
 }
 
 typedef struct {
 	WidthHeight wh;
 	Display* disp;
-	XImage* img;
+	unsigned char* data;
 	Error error;
 } ScreenshotVariables;
 
@@ -73,9 +70,9 @@ ScreenshotVariables grab_screenshot(void) {
 	XWindowAttributes gwa;
 	XGetWindowAttributes(sv.disp, root, &gwa);
 
-	sv.img = XGetImage(sv.disp, root, 0, 0, gwa.width, gwa.height,
-	                   AllPlanes, ZPixmap);
-	if (!sv.img) {
+	XImage* img = XGetImage(sv.disp, root, 0, 0, gwa.width, gwa.height,
+	                         AllPlanes, ZPixmap);
+	if (!img) {
 		fprintf(stderr, "Error: XGetImage failed\n");
 		XCloseDisplay(sv.disp);
 		sv.disp  = NULL;
@@ -83,13 +80,57 @@ ScreenshotVariables grab_screenshot(void) {
 		return sv;
 	}
 
-	sv.wh.width  = gwa.width;
-	sv.wh.height = gwa.height;
+	/* Extract pixel data from XImage */
+	int width = img->width;
+	int height = img->height;
+	unsigned char* data = malloc(width * height * 3);
+	if (!data) {
+		fprintf(stderr, "Error: malloc failed for image data\n");
+		XDestroyImage(img);
+		XCloseDisplay(sv.disp);
+		sv.error = ERR_MEMORY;
+		return sv;
+	}
+
+	int r_shift = 0, g_shift = 0, b_shift = 0;
+	unsigned long mask;
+
+	mask = img->red_mask;
+	while ((mask & 1) == 0) {
+		mask >>= 1;
+		r_shift++;
+	}
+	mask = img->green_mask;
+	while ((mask & 1) == 0) {
+		mask >>= 1;
+		g_shift++;
+	}
+	mask = img->blue_mask;
+	while ((mask & 1) == 0) {
+		mask >>= 1;
+		b_shift++;
+	}
+
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			unsigned long pixel = XGetPixel(img, x, y);
+			unsigned char* p    = &data[(y * width + x) * 3];
+			p[0] = (pixel & img->red_mask) >> r_shift;
+			p[1] = (pixel & img->green_mask) >> g_shift;
+			p[2] = (pixel & img->blue_mask) >> b_shift;
+		}
+	}
+
+	XDestroyImage(img);
+
+	sv.wh.width  = width;
+	sv.wh.height = height;
+	sv.data      = data;
 	sv.error     = ERR_OK;
 	return sv;
 }
 
-CropRect select_crop_area(Display* disp, XImage* screenshot, int screen_width, int screen_height) {
+CropRect select_crop_area(Display* disp, unsigned char* screenshot_data, int screen_width, int screen_height) {
 	CropRect rect = {0, 0, 0, 0};
 	Window root = RootWindow(disp, DefaultScreen(disp));
 	XEvent event;
@@ -97,7 +138,7 @@ CropRect select_crop_area(Display* disp, XImage* screenshot, int screen_width, i
 	int end_x = 0, end_y = 0;
 	int selection_active = 0;
 
-	/* Create overlay window with the screenshot pixmap */
+	/* Create overlay window */
 	XSetWindowAttributes attr;
 	attr.background_pixel = BlackPixel(disp, DefaultScreen(disp));
 	attr.override_redirect = True;
@@ -109,9 +150,21 @@ CropRect select_crop_area(Display* disp, XImage* screenshot, int screen_width, i
 	XRaiseWindow(disp, overlay);
 	XSelectInput(disp, overlay, PointerMotionMask | ButtonPressMask | ButtonReleaseMask | ExposureMask);
 
-	/* Put screenshot on the overlay */
+	/* Create XImage from raw pixel data for display */
+	XImage* display_img = XCreateImage(disp, DefaultVisual(disp, DefaultScreen(disp)),
+	                                     DefaultDepth(disp, DefaultScreen(disp)),
+	                                     ZPixmap, 0, (char*)screenshot_data,
+	                                     screen_width, screen_height, 8, screen_width * 3);
+	if (!display_img) {
+		fprintf(stderr, "Error: XCreateImage failed\n");
+		XDestroyWindow(disp, overlay);
+		return rect;
+	}
+
 	GC gc = XCreateGC(disp, overlay, 0, NULL);
-	XPutImage(disp, overlay, gc, screenshot, 0, 0, 0, 0, screen_width, screen_height);
+
+	/* Display the screenshot */
+	XPutImage(disp, overlay, gc, display_img, 0, 0, 0, 0, screen_width, screen_height);
 
 	/* Create GC for drawing red rectangle */
 	GC rect_gc = XCreateGC(disp, overlay, 0, NULL);
@@ -137,7 +190,7 @@ CropRect select_crop_area(Display* disp, XImage* screenshot, int screen_width, i
 			end_y = event.xmotion.y;
 
 			/* Redraw screenshot + rectangle */
-			XPutImage(disp, overlay, gc, screenshot, 0, 0, 0, 0, screen_width, screen_height);
+			XPutImage(disp, overlay, gc, display_img, 0, 0, 0, 0, screen_width, screen_height);
 
 			int x = (start_x < end_x) ? start_x : end_x;
 			int y = (start_y < end_y) ? start_y : end_y;
@@ -158,6 +211,8 @@ CropRect select_crop_area(Display* disp, XImage* screenshot, int screen_width, i
 	XDestroyWindow(disp, overlay);
 	XFreeGC(disp, rect_gc);
 	XFreeGC(disp, gc);
+	display_img->data = NULL;
+	XDestroyImage(display_img);
 
 	rect.x = (start_x < end_x) ? start_x : end_x;
 	rect.y = (start_y < end_y) ? start_y : end_y;
@@ -181,48 +236,29 @@ CropRect select_crop_area(Display* disp, XImage* screenshot, int screen_width, i
 	return rect;
 }
 
-Error extract_data(XImage* img, unsigned char** data_out, CropRect* crop) {
-	int width  = crop ? crop->width : img->width;
-	int height = crop ? crop->height : img->height;
-	int start_x = crop ? crop->x : 0;
-	int start_y = crop ? crop->y : 0;
+Error extract_crop(unsigned char* full_data, int full_width, unsigned char** crop_data_out, CropRect* crop) {
+	int width = crop->width;
+	int height = crop->height;
+	int start_x = crop->x;
+	int start_y = crop->y;
 
-	unsigned char* data = malloc(width * height * 3);
-	if (!data) {
-		fprintf(stderr, "Error: malloc failed for image data\n");
+	unsigned char* crop_data = malloc(width * height * 3);
+	if (!crop_data) {
+		fprintf(stderr, "Error: malloc failed for crop data\n");
 		return ERR_MEMORY;
-	}
-
-	int r_shift = 0, g_shift = 0, b_shift = 0;
-	unsigned long mask;
-
-	mask = img->red_mask;
-	while ((mask & 1) == 0) {
-		mask >>= 1;
-		r_shift++;
-	}
-	mask = img->green_mask;
-	while ((mask & 1) == 0) {
-		mask >>= 1;
-		g_shift++;
-	}
-	mask = img->blue_mask;
-	while ((mask & 1) == 0) {
-		mask >>= 1;
-		b_shift++;
 	}
 
 	for (int y = 0; y < height; y++) {
 		for (int x = 0; x < width; x++) {
-			unsigned long pixel = XGetPixel(img, start_x + x, start_y + y);
-			unsigned char* p    = &data[(y * width + x) * 3];
-			p[0] = (pixel & img->red_mask) >> r_shift;
-			p[1] = (pixel & img->green_mask) >> g_shift;
-			p[2] = (pixel & img->blue_mask) >> b_shift;
+			unsigned char* src = &full_data[((start_y + y) * full_width + (start_x + x)) * 3];
+			unsigned char* dst = &crop_data[(y * width + x) * 3];
+			dst[0] = src[0];
+			dst[1] = src[1];
+			dst[2] = src[2];
 		}
 	}
 
-	*data_out = data;
+	*crop_data_out = crop_data;
 	return ERR_OK;
 }
 
@@ -376,26 +412,35 @@ int main(int argc, char* argv[]) {
 		return sv.error;
 	}
 
-	cv.disp        = sv.disp;
-	cv.img         = sv.img;
+	cv.disp = sv.disp;
+	cv.data = sv.data;
 	WidthHeight wh = sv.wh;
 
-	CropRect crop_rect = {0};
-	if (mode == MODE_CROP) {
-		crop_rect = select_crop_area(sv.disp, sv.img, wh.width, wh.height);
-		wh.width = crop_rect.width;
-		wh.height = crop_rect.height;
-	}
+	unsigned char* final_data = sv.data;
+	WidthHeight final_wh = wh;
 
-	Error e = extract_data(cv.img, &cv.data, mode == MODE_CROP ? &crop_rect : NULL);
-	if (e != ERR_OK) {
-		cleanup(&cv);
-		return e;
+	if (mode == MODE_CROP) {
+		CropRect crop_rect = select_crop_area(sv.disp, sv.data, wh.width, wh.height);
+		
+		Error e = extract_crop(sv.data, wh.width, &final_data, &crop_rect);
+		if (e != ERR_OK) {
+			cleanup(&cv);
+			return e;
+		}
+
+		/* Only free the full screenshot if we extracted a crop */
+		if (final_data != sv.data) {
+			free(sv.data);
+		}
+
+		final_wh.width = crop_rect.width;
+		final_wh.height = crop_rect.height;
 	}
 
 	FilenameWithError fwe = make_filename();
 	if (fwe.error != ERR_OK) {
 		fprintf(stderr, "Error: failed to allocate filename\n");
+		if (final_data != sv.data) free(final_data);
 		cleanup(&cv);
 		return fwe.error;
 	}
@@ -404,11 +449,12 @@ int main(int argc, char* argv[]) {
 	if (!full_path) {
 		fprintf(stderr, "Error: failed to allocate path\n");
 		free(fwe.filename);
+		if (final_data != sv.data) free(final_data);
 		cleanup(&cv);
 		return ERR_MEMORY;
 	}
 
-	e = save_png(full_path, cv.data, wh);
+	Error e = save_png(full_path, final_data, final_wh);
 	if (e != ERR_OK) {
 		fprintf(stderr, "Error saving PNG: %s\n", full_path);
 	} else {
@@ -417,6 +463,7 @@ int main(int argc, char* argv[]) {
 
 	free(full_path);
 	free(fwe.filename);
+	if (final_data != sv.data) free(final_data);
 	cleanup(&cv);
 	return e;
 }
