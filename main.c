@@ -40,11 +40,12 @@ typedef struct {
 	Display* disp;
 	unsigned char* data;
 	char* filename;
+	int should_free_data;
 } CleanupVariables;
 
 void cleanup(CleanupVariables* cv) {
 	if (!cv) return;
-	if (cv->data) free(cv->data);
+	if (cv->data && cv->should_free_data) free(cv->data);
 	if (cv->filename) free(cv->filename);
 	if (cv->disp) XCloseDisplay(cv->disp);
 }
@@ -150,21 +151,28 @@ CropRect select_crop_area(Display* disp, unsigned char* screenshot_data, int scr
 	XRaiseWindow(disp, overlay);
 	XSelectInput(disp, overlay, PointerMotionMask | ButtonPressMask | ButtonReleaseMask | ExposureMask);
 
-	/* Create XImage from raw pixel data for display */
-	XImage* display_img = XCreateImage(disp, DefaultVisual(disp, DefaultScreen(disp)),
-	                                     DefaultDepth(disp, DefaultScreen(disp)),
-	                                     ZPixmap, 0, (char*)screenshot_data,
-	                                     screen_width, screen_height, 8, screen_width * 3);
-	if (!display_img) {
-		fprintf(stderr, "Error: XCreateImage failed\n");
-		XDestroyWindow(disp, overlay);
-		return rect;
-	}
+	/* Create a temporary XImage for display (doesn't own data) */
+	XImage display_img = {
+		.width = screen_width,
+		.height = screen_height,
+		.xoffset = 0,
+		.format = ZPixmap,
+		.data = (char*)screenshot_data,
+		.byte_order = LSBFirst,
+		.bitmap_unit = 8,
+		.bitmap_pad = 8,
+		.depth = 24,
+		.bytes_per_line = screen_width * 3,
+		.bits_per_pixel = 24,
+		.red_mask = 0xFF0000,
+		.green_mask = 0x00FF00,
+		.blue_mask = 0x0000FF
+	};
 
 	GC gc = XCreateGC(disp, overlay, 0, NULL);
 
 	/* Display the screenshot */
-	XPutImage(disp, overlay, gc, display_img, 0, 0, 0, 0, screen_width, screen_height);
+	XPutImage(disp, overlay, gc, &display_img, 0, 0, 0, 0, screen_width, screen_height);
 
 	/* Create GC for drawing red rectangle */
 	GC rect_gc = XCreateGC(disp, overlay, 0, NULL);
@@ -190,7 +198,7 @@ CropRect select_crop_area(Display* disp, unsigned char* screenshot_data, int scr
 			end_y = event.xmotion.y;
 
 			/* Redraw screenshot + rectangle */
-			XPutImage(disp, overlay, gc, display_img, 0, 0, 0, 0, screen_width, screen_height);
+			XPutImage(disp, overlay, gc, &display_img, 0, 0, 0, 0, screen_width, screen_height);
 
 			int x = (start_x < end_x) ? start_x : end_x;
 			int y = (start_y < end_y) ? start_y : end_y;
@@ -211,8 +219,6 @@ CropRect select_crop_area(Display* disp, unsigned char* screenshot_data, int scr
 	XDestroyWindow(disp, overlay);
 	XFreeGC(disp, rect_gc);
 	XFreeGC(disp, gc);
-	display_img->data = NULL;
-	XDestroyImage(display_img);
 
 	rect.x = (start_x < end_x) ? start_x : end_x;
 	rect.y = (start_y < end_y) ? start_y : end_y;
@@ -404,7 +410,9 @@ int main(int argc, char* argv[]) {
 		}
 	}
 
-	CleanupVariables cv    = {0};
+	CleanupVariables cv = {0};
+	cv.should_free_data = 1;
+
 	ScreenshotVariables sv = grab_screenshot();
 
 	if (sv.error != ERR_OK) {
@@ -426,11 +434,6 @@ int main(int argc, char* argv[]) {
 		if (e != ERR_OK) {
 			cleanup(&cv);
 			return e;
-		}
-
-		/* Only free the full screenshot if we extracted a crop */
-		if (final_data != sv.data) {
-			free(sv.data);
 		}
 
 		final_wh.width = crop_rect.width;
