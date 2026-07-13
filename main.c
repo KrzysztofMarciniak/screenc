@@ -1,5 +1,6 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Ximage.h>
 #include <png.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,20 +25,6 @@ typedef enum {
 	MODE_CROP,
 } ScreenMode;
 
-typedef char Filename;
-
-typedef struct {
-	Filename* filename;
-	Error error;
-} FilenameWithError;
-
-typedef struct {
-	Display* disp;
-	XImage* img;
-	unsigned char* data;
-	char* filename;
-} CleanupVariables;
-
 typedef struct {
 	int x;
 	int y;
@@ -49,6 +36,13 @@ typedef struct {
 	int width;
 	int height;
 } WidthHeight;
+
+typedef struct {
+	Display* disp;
+	XImage* img;
+	unsigned char* data;
+	char* filename;
+} CleanupVariables;
 
 void cleanup(CleanupVariables* cv) {
 	if (!cv) return;
@@ -95,7 +89,7 @@ ScreenshotVariables grab_screenshot(void) {
 	return sv;
 }
 
-CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
+CropRect select_crop_area(Display* disp, XImage* screenshot, int screen_width, int screen_height) {
 	CropRect rect = {0, 0, 0, 0};
 	Window root = RootWindow(disp, DefaultScreen(disp));
 	XEvent event;
@@ -103,7 +97,7 @@ CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
 	int end_x = 0, end_y = 0;
 	int selection_active = 0;
 
-	/* Create overlay window - transparent but input-aware */
+	/* Create overlay window with the screenshot pixmap */
 	XSetWindowAttributes attr;
 	attr.background_pixel = BlackPixel(disp, DefaultScreen(disp));
 	attr.override_redirect = True;
@@ -115,15 +109,17 @@ CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
 	XRaiseWindow(disp, overlay);
 	XSelectInput(disp, overlay, PointerMotionMask | ButtonPressMask | ButtonReleaseMask | ExposureMask);
 
-	/* Create GC for drawing red rectangle on overlay */
+	/* Put screenshot on the overlay */
 	GC gc = XCreateGC(disp, overlay, 0, NULL);
+	XPutImage(disp, overlay, gc, screenshot, 0, 0, 0, 0, screen_width, screen_height);
 
-	/* Set red color */
+	/* Create GC for drawing red rectangle */
+	GC rect_gc = XCreateGC(disp, overlay, 0, NULL);
 	XColor red_color, dummy;
 	XAllocNamedColor(disp, DefaultColormap(disp, DefaultScreen(disp)),
 	                  "red", &red_color, &dummy);
-	XSetForeground(disp, gc, red_color.pixel);
-	XSetLineAttributes(disp, gc, 3, LineSolid, CapButt, JoinBevel);
+	XSetForeground(disp, rect_gc, red_color.pixel);
+	XSetLineAttributes(disp, rect_gc, 2, LineSolid, CapButt, JoinBevel);
 
 	fprintf(stderr, "Click and drag to select crop area...\n");
 
@@ -140,8 +136,8 @@ CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
 			end_x = event.xmotion.x;
 			end_y = event.xmotion.y;
 
-			/* Clear and redraw */
-			XClearWindow(disp, overlay);
+			/* Redraw screenshot + rectangle */
+			XPutImage(disp, overlay, gc, screenshot, 0, 0, 0, 0, screen_width, screen_height);
 
 			int x = (start_x < end_x) ? start_x : end_x;
 			int y = (start_y < end_y) ? start_y : end_y;
@@ -149,7 +145,7 @@ CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
 			int h = (start_y < end_y) ? (end_y - start_y) : (start_y - end_y);
 
 			if (w > 0 && h > 0) {
-				XDrawRectangle(disp, overlay, gc, x, y, w, h);
+				XDrawRectangle(disp, overlay, rect_gc, x, y, w, h);
 			}
 			XSync(disp, False);
 		} else if (event.type == ButtonRelease) {
@@ -160,6 +156,7 @@ CropRect select_crop_area(Display* disp, int screen_width, int screen_height) {
 	}
 
 	XDestroyWindow(disp, overlay);
+	XFreeGC(disp, rect_gc);
 	XFreeGC(disp, gc);
 
 	rect.x = (start_x < end_x) ? start_x : end_x;
@@ -228,6 +225,11 @@ Error extract_data(XImage* img, unsigned char** data_out, CropRect* crop) {
 	*data_out = data;
 	return ERR_OK;
 }
+
+typedef struct {
+	char* filename;
+	Error error;
+} FilenameWithError;
 
 FilenameWithError make_filename(void) {
 	FilenameWithError result = {.filename = NULL, .error = ERR_OK};
@@ -380,7 +382,7 @@ int main(int argc, char* argv[]) {
 
 	CropRect crop_rect = {0};
 	if (mode == MODE_CROP) {
-		crop_rect = select_crop_area(sv.disp, wh.width, wh.height);
+		crop_rect = select_crop_area(sv.disp, sv.img, wh.width, wh.height);
 		wh.width = crop_rect.width;
 		wh.height = crop_rect.height;
 	}
